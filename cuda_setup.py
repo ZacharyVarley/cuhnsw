@@ -220,12 +220,12 @@ def prepare_cuda():
 
     if sys.platform == "win32":
         cudaconfig['lib64'] = os.path.join(cuda_home, 'lib', 'x64')
-        post_args += ['-Xcompiler', '/MD', '-std=c++14',  "-Xcompiler", "/openmp"]
+        post_args += ['-Xcompiler', '/MD', '-std=c++17',  "-Xcompiler", "/openmp"]
         if HALF_PRECISION:
             post_args += ["-Xcompiler", "/D HALF_PRECISION"]
     else:
         post_args += ['-c', '--compiler-options', "'-fPIC'",
-            "--compiler-options", "'-std=c++14'"]
+            "--compiler-options", "'-std=c++17'"]
         if HALF_PRECISION:
             post_args += ["--compiler-options", "'-D HALF_PRECISION'"]
 
