@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import subprocess
+import re
 import ctypes
 import json
 from typing import Any, Dict, List
