@@ -215,7 +215,7 @@ def prepare_cuda():
 
     # Set CUDA version-specific post-args
     specs = get_cuda_device_specs()
-    arch = str(specs["compute_capability"][0]) + str(specs["compute_capability"][1])
+    arch = str(specs[0]["compute_capability"][0]) + str(specs[0]["compute_capability"][1])
     post_args = [f"-arch=sm_{arch}", "--ptxas-options=-v", "-O2"]
 
     if sys.platform == "win32":
