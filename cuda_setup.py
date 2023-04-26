@@ -11,6 +11,10 @@
 import logging
 import os
 import sys
+import ctypes
+import json
+from typing import Any, Dict, List
+from warnings import warn
 
 from distutils import ccompiler, errors, msvccompiler, unixccompiler
 from setuptools.command.build_ext import build_ext as setuptools_build_ext
@@ -18,132 +22,213 @@ from setuptools.command.build_ext import build_ext as setuptools_build_ext
 
 HALF_PRECISION = False
 
-def find_in_path(name, path):
-  "Find a file in a search path"
-  # adapted fom http://code.activestate.com/
-  # recipes/52224-find-a-file-given-a-search-path/
-  for _dir in path.split(os.pathsep):
-    binpath = os.path.join(_dir, name)
-    if os.path.exists(binpath):
-      return os.path.abspath(binpath)
-  return None
 
-# reference: https://arnon.dk/
-# matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
-def get_cuda_sm_list(cuda_ver):
-  if "CUDA_SM_LIST" in os.environ:
-    sm_list = os.environ["CUDA_SM_LIST"].split(",")
-  else:
-    sm_list = ["30", "52", "60", "61", "70", "75", "80", "86"]
-    if cuda_ver >= 110:
-      filter_list = ["30"]
-      if cuda_ver == 110:
-        filter_list += ["86"]
+# One of the following libraries must be available to load
+libnames = ('libcuda.so', 'libcuda.dylib', 'cuda.dll')
+for libname in libnames:
+    try:
+        cuda = ctypes.CDLL(libname)
+    except OSError:
+        continue
     else:
-      filter_list = ["80", "86"]
-      if cuda_ver < 100:
-        filter_list += ["75"]
-      if cuda_ver < 90:
-        filter_list += ["70"]
-      if cuda_ver < 80:
-        filter_list += ["60", "61"]
-    sm_list = [sm for sm in sm_list if sm not in filter_list]
-  return sm_list
+        break
+else:
+    raise ImportError(f'Could not load any of: {", ".join(libnames)}')
+
+# Constants from cuda.h
+CUDA_SUCCESS = 0
+CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16
+CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR = 39
+CU_DEVICE_ATTRIBUTE_CLOCK_RATE = 13
+CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE = 36
+
+# Conversions from semantic version numbers
+# Borrowed from original gist and updated from the "GPUs supported" section of this Wikipedia article
+# https://en.wikipedia.org/wiki/CUDA
+SEMVER_TO_CORES = {
+    (1, 0): 8,    # Tesla
+    (1, 1): 8,
+    (1, 2): 8,
+    (1, 3): 8,
+    (2, 0): 32,   # Fermi
+    (2, 1): 48,
+    (3, 0): 192,  # Kepler
+    (3, 2): 192,
+    (3, 5): 192,
+    (3, 7): 192,
+    (5, 0): 128,  # Maxwell
+    (5, 2): 128,
+    (5, 3): 128,
+    (6, 0): 64,   # Pascal
+    (6, 1): 128,
+    (6, 2): 128,
+    (7, 0): 64,   # Volta
+    (7, 2): 64,
+    (7, 5): 64,   # Turing
+    (8, 0): 64,   # Ampere
+    (8, 6): 64,
+}
+SEMVER_TO_ARCH = {
+    (1, 0): 'tesla',
+    (1, 1): 'tesla',
+    (1, 2): 'tesla',
+    (1, 3): 'tesla',
+
+    (2, 0): 'fermi',
+    (2, 1): 'fermi',
+
+    (3, 0): 'kepler',
+    (3, 2): 'kepler',
+    (3, 5): 'kepler',
+    (3, 7): 'kepler',
+
+    (5, 0): 'maxwell',
+    (5, 2): 'maxwell',
+    (5, 3): 'maxwell',
+
+    (6, 0): 'pascal',
+    (6, 1): 'pascal',
+    (6, 2): 'pascal',
+
+    (7, 0): 'volta',
+    (7, 2): 'volta',
+
+    (7, 5): 'turing',
+
+    (8, 0): 'ampere',
+    (8, 6): 'ampere',
+}
 
 
-def get_cuda_compute(cuda_ver):
-  if "CUDA_COMPUTE" in os.environ:
-    compute = os.environ["CUDA_COMPUTE"]
-  else:
-    if 70 <= cuda_ver < 80:
-      compute = "52"
-    if 80 <= cuda_ver < 90:
-      compute = "61"
-    if 90 <= cuda_ver < 100:
-      compute = "70"
-    if 100 <= cuda_ver < 110:
-      compute = "75"
-    if cuda_ver == 110:
-      compute = "80"
-    if cuda_ver == 111:
-      compute = "86"
-  return compute
+def get_cuda_device_specs() -> List[Dict[str, Any]]:
+    """Generate spec for each GPU device with format
 
-
-def get_cuda_arch(cuda_ver):
-  if "CUDA_ARCH" in os.environ:
-    arch = os.environ["CUDA_ARCH"]
-  else:
-    if 70 <= cuda_ver < 92:
-      arch = "30"
-    if 92 <= cuda_ver < 110:
-      arch = "50"
-    if cuda_ver == 110:
-      arch = "52"
-    if cuda_ver == 111:
-      arch = "80"
-  return arch
-
-def locate_cuda():
-    """Locate the CUDA environment on the system
-    If a valid CUDA installation is found,
-    this returns a dict with keys 'home', 'nvcc', 'include',
-    and 'lib64' and values giving the absolute path to each directory.
-    Starts by looking for the CUDAHOME env variable.
-    If not found, everything is based on finding 'nvcc' in the PATH.
-    If nvcc can't be found, this returns None.
+    {
+        'name': str,
+        'compute_capability': (major: int, minor: int),
+        'cores': int,
+        'cuda_cores': int,
+        'concurrent_threads': int,
+        'gpu_clock_mhz': float,
+        'mem_clock_mhz': float,
+        'total_mem_mb': float,
+        'free_mem_mb': float
+    }
     """
-    nvcc_bin = 'nvcc'
-    if sys.platform.startswith("win"):
-        nvcc_bin = 'nvcc.exe'
 
-    # Look for CUDA installation within a Mamba environment
-    cuda_home = os.path.join(sys.prefix, "compiler_compat", "cuda")
-    nvcc = os.path.join(cuda_home, "bin", nvcc_bin)
-    if not os.path.exists(nvcc):
-        logging.warning("Could not find 'nvcc' binary within the CUDA installation at %s. "
-                        "Either install CUDA or set the CUDA_HOME environment variable.", cuda_home)
+    # Type-binding definitions for ctypes
+    num_gpus = ctypes.c_int()
+    name = b' ' * 100
+    cc_major = ctypes.c_int()
+    cc_minor = ctypes.c_int()
+    cores = ctypes.c_int()
+    threads_per_core = ctypes.c_int()
+    clockrate = ctypes.c_int()
+    free_mem = ctypes.c_size_t()
+    total_mem = ctypes.c_size_t()
+    result = ctypes.c_int()
+    device = ctypes.c_int()
+    context = ctypes.c_void_p()
+    error_str = ctypes.c_char_p()
+
+    # Check expected initialization
+    result = cuda.cuInit(0)
+    if result != CUDA_SUCCESS:
+        cuda.cuGetErrorString(result, ctypes.byref(error_str))
+        raise RuntimeError(f'cuInit failed with error code {result}: {error_str.value.decode()}')
+    result = cuda.cuDeviceGetCount(ctypes.byref(num_gpus))
+    if result != CUDA_SUCCESS:
+        cuda.cuGetErrorString(result, ctypes.byref(error_str))
+        raise RuntimeError(f'cuDeviceGetCount failed with error code {result}: {error_str.value.decode()}')
+
+    # Iterate through available devices
+    device_specs = []
+    for i in range(num_gpus.value):
+        spec = {}
+        result = cuda.cuDeviceGet(ctypes.byref(device), i)
+        if result != CUDA_SUCCESS:
+            cuda.cuGetErrorString(result, ctypes.byref(error_str))
+            raise RuntimeError(f'cuDeviceGet failed with error code {result}: {error_str.value.decode()}')
+
+        # Parse specs for each device
+        if cuda.cuDeviceGetName(ctypes.c_char_p(name), len(name), device) == CUDA_SUCCESS:
+            spec.update(name=name.split(b'\0', 1)[0].decode())
+        if cuda.cuDeviceComputeCapability(ctypes.byref(cc_major), ctypes.byref(cc_minor), device) == CUDA_SUCCESS:
+            spec.update(compute_capability=(cc_major.value, cc_minor.value))
+            spec.update(architecture=SEMVER_TO_ARCH.get((cc_major.value, cc_minor.value), 'unknown'))
+        if cuda.cuDeviceGetAttribute(ctypes.byref(cores), CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device) == CUDA_SUCCESS:
+            spec.update(
+                cores=cores.value,
+                cuda_cores=cores.value * SEMVER_TO_CORES.get((cc_major.value, cc_minor.value), 'unknown'))
+            if cuda.cuDeviceGetAttribute(ctypes.byref(threads_per_core), CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, device) == CUDA_SUCCESS:
+                spec.update(concurrent_threads=cores.value * threads_per_core.value)
+        if cuda.cuDeviceGetAttribute(ctypes.byref(clockrate), CU_DEVICE_ATTRIBUTE_CLOCK_RATE, device) == CUDA_SUCCESS:
+            spec.update(gpu_clock_mhz=clockrate.value / 1000.)
+        if cuda.cuDeviceGetAttribute(ctypes.byref(clockrate), CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, device) == CUDA_SUCCESS:
+            spec.update(mem_clock_mhz=clockrate.value / 1000.)
+        device_specs.append(spec)
+    return device_specs
+  
+
+def prepare_cuda():
+    """Locate the CUDA environment on the system
+    If a valid CUDA installation is found
+    this returns a dictionary with keys 'home', 'nvcc', 'include',
+    and 'lib64' and values giving the absolute path to each directory.
+    """
+    cudaconfig = {}
+
+    # Check if CUDA is installed
+    try:
+        output = subprocess.check_output(['nvcc', '--version'], stderr=subprocess.STDOUT)
+    except OSError:
+        logging.warning('nvcc not found. CUDA is not installed')
         return None
 
-    # Construct dictionary of CUDA configuration information
-    cudaconfig = {'home': cuda_home,
-                  'nvcc': nvcc,
-                  'include': os.path.join(cuda_home, 'include'),
-                  'lib64': os.path.join(cuda_home, 'lib64')}
+    # Extract CUDA version from output
+    version_str = output.decode('utf-8')
+    version_match = re.search(r'release\s+([\d\.]+)', version_str)
+    if not version_match:
+        logging.warning('Failed to extract CUDA version from nvcc output')
+        return None
 
-    # Get CUDA version and compute capability
-    cuda_ver = os.path.basename(os.path.realpath(cuda_home)).split("-")[1].split(".")
-    major, minor = int(cuda_ver[0]), int(cuda_ver[1])
-    cuda_ver = 10 * major + minor
-    assert cuda_ver >= 70, f"too low cuda ver {major}.{minor}"
-    print(f"cuda_ver: {major}.{minor}")
-    arch = get_cuda_arch(cuda_ver)
-    sm_list = get_cuda_sm_list(cuda_ver)
-    compute = get_cuda_compute(cuda_ver)
+    cuda_ver = version_match.group(1)
+    major, minor = map(int, cuda_ver.split('.'))
+    cuda_ver_int = 10 * major + minor
 
-    # Construct list of compiler options for nvcc
-    post_args = [f"-arch=sm_{arch}"] + \
-                [f"-gencode=arch=compute_{sm},code=sm_{sm}" for sm in sm_list] + \
-                [f"-gencode=arch=compute_{compute},code=compute_{compute}",
-                 "--ptxas-options=-v", "-O2"]
-    print(f"nvcc post args: {post_args}")
-    if HALF_PRECISION:
-        post_args = [flag for flag in post_args if "52" not in flag]
+    # Set CUDA environment variables
+    cuda_home = os.environ.get('CUDA_HOME', '')
+    if not cuda_home:
+        cuda_home = os.environ['CONDA_PREFIX']
+        if not os.path.isdir(cuda_home):
+            cuda_home = ''
+    if not cuda_home:
+        logging.warning('CUDA_HOME is not set. Please set it to enable CUDA extensions.')
+        return None
 
-    # Append additional compiler options for non-Windows platforms
-    if sys.platform != "win32":
+    cudaconfig['home'] = cuda_home
+    cudaconfig['nvcc'] = os.path.join(cuda_home, 'bin', 'nvcc')
+    cudaconfig['include'] = os.path.join(cuda_home, 'include')
+    cudaconfig['lib64'] = os.path.join(cuda_home, 'lib64')
+
+    # Set CUDA version-specific post-args
+    specs = get_cuda_device_specs()
+    arch = str(specs["compute_capability"][0]) + str(specs["compute_capability"][1])
+    post_args = [f"-arch=sm_{arch}", "--ptxas-options=-v", "-O2"]
+
+    if sys.platform == "win32":
+        cudaconfig['lib64'] = os.path.join(cuda_home, 'lib', 'x64')
+        post_args += ['-Xcompiler', '/MD', '-std=c++14',  "-Xcompiler", "/openmp"]
+        if HALF_PRECISION:
+            post_args += ["-Xcompiler", "/D HALF_PRECISION"]
+    else:
         post_args += ['-c', '--compiler-options', "'-fPIC'",
-                      "--compiler-options", "'-std=c++14'"]
+            "--compiler-options", "'-std=c++14'"]
         if HALF_PRECISION:
             post_args += ["--compiler-options", "'-D HALF_PRECISION'"]
 
-    # Check that all CUDA directories exist
-    for k, val in cudaconfig.items():
-        if not os.path.exists(val):
-            logging.warning('The CUDA %s path could not be located in %s', k, val)
-            return None
-
     cudaconfig['post_args'] = post_args
+
     return cudaconfig
 
 
@@ -249,6 +334,6 @@ class CudaBuildExt(setuptools_build_ext):
     setuptools_build_ext.run(self)
 
 
-CUDA = locate_cuda()
+CUDA = prepare_cuda()
 assert CUDA is not None
 BUILDEXT = CudaBuildExt if CUDA else setuptools_build_ext
