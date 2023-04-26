@@ -85,75 +85,66 @@ def get_cuda_arch(cuda_ver):
   return arch
 
 def locate_cuda():
-  """Locate the CUDA environment on the system
-  If a valid cuda installation is found
-  this returns a dict with keys 'home', 'nvcc', 'include',
-  and 'lib64' and values giving the absolute path to each directory.
-  Starts by looking for the CUDAHOME env variable.
-  If not found, everything is based on finding
-  'nvcc' in the PATH.
-  If nvcc can't be found, this returns None
-  """
-  nvcc_bin = 'nvcc'
-  if sys.platform.startswith("win"):
-    nvcc_bin = 'nvcc.exe'
+    """Locate the CUDA environment on the system
+    If a valid CUDA installation is found,
+    this returns a dict with keys 'home', 'nvcc', 'include',
+    and 'lib64' and values giving the absolute path to each directory.
+    Starts by looking for the CUDAHOME env variable.
+    If not found, everything is based on finding 'nvcc' in the PATH.
+    If nvcc can't be found, this returns None.
+    """
+    nvcc_bin = 'nvcc'
+    if sys.platform.startswith("win"):
+        nvcc_bin = 'nvcc.exe'
 
-  # check env variables CUDA_HOME, CUDAHOME, CUDA_PATH.
-  found = False
-  for env_name in ['CUDA_PATH', 'CUDAHOME', 'CUDA_HOME']:
-    if env_name not in os.environ:
-      continue
-    found = True
-    home = os.environ[env_name]
-    nvcc = os.path.join(home, 'bin', nvcc_bin)
-    break
-  if not found:
-    # otherwise, search the PATH for NVCC
-    nvcc = find_in_path(nvcc_bin, os.environ['PATH'])
-    if nvcc is None:
-      logging.warning('The nvcc binary could not be located in your '
-              '$PATH. Either add it to '
-              'your path, or set $CUDA_HOME to enable CUDA extensions')
-      return None
-    home = os.path.dirname(os.path.dirname(nvcc))
+    # Look for CUDA installation within a Mamba environment
+    cuda_home = os.path.join(sys.prefix, "compiler_compat", "cuda")
+    nvcc = os.path.join(cuda_home, "bin", nvcc_bin)
+    if not os.path.exists(nvcc):
+        logging.warning("Could not find 'nvcc' binary within the CUDA installation at %s. "
+                        "Either install CUDA or set the CUDA_HOME environment variable.", cuda_home)
+        return None
 
-  cudaconfig = {'home': home,
-                'nvcc': nvcc,
-                'include': os.path.join(home, 'include'),
-                'lib64':   os.path.join(home, 'lib64')}
-  cuda_ver = os.path.basename(os.path.realpath(home)).split("-")[1].split(".")
-  major, minor = int(cuda_ver[0]), int(cuda_ver[1])
-  cuda_ver = 10 * major + minor
-  assert cuda_ver >= 70, f"too low cuda ver {major}.{minor}"
-  print(f"cuda_ver: {major}.{minor}")
-  arch = get_cuda_arch(cuda_ver)
-  sm_list = get_cuda_sm_list(cuda_ver)
-  compute = get_cuda_compute(cuda_ver)
-  post_args = [f"-arch=sm_{arch}"] + \
-    [f"-gencode=arch=compute_{sm},code=sm_{sm}" for sm in sm_list] + \
-    [f"-gencode=arch=compute_{compute},code=compute_{compute}",
-     "--ptxas-options=-v", "-O2"]
-  print(f"nvcc post args: {post_args}")
-  if HALF_PRECISION:
-    post_args = [flag for flag in post_args if "52" not in flag]
+    # Construct dictionary of CUDA configuration information
+    cudaconfig = {'home': cuda_home,
+                  'nvcc': nvcc,
+                  'include': os.path.join(cuda_home, 'include'),
+                  'lib64': os.path.join(cuda_home, 'lib64')}
 
-  if sys.platform == "win32":
-    cudaconfig['lib64'] = os.path.join(home, 'lib', 'x64')
-    post_args += ['-Xcompiler', '/MD', '-std=c++14',  "-Xcompiler", "/openmp"]
+    # Get CUDA version and compute capability
+    cuda_ver = os.path.basename(os.path.realpath(cuda_home)).split("-")[1].split(".")
+    major, minor = int(cuda_ver[0]), int(cuda_ver[1])
+    cuda_ver = 10 * major + minor
+    assert cuda_ver >= 70, f"too low cuda ver {major}.{minor}"
+    print(f"cuda_ver: {major}.{minor}")
+    arch = get_cuda_arch(cuda_ver)
+    sm_list = get_cuda_sm_list(cuda_ver)
+    compute = get_cuda_compute(cuda_ver)
+
+    # Construct list of compiler options for nvcc
+    post_args = [f"-arch=sm_{arch}"] + \
+                [f"-gencode=arch=compute_{sm},code=sm_{sm}" for sm in sm_list] + \
+                [f"-gencode=arch=compute_{compute},code=compute_{compute}",
+                 "--ptxas-options=-v", "-O2"]
+    print(f"nvcc post args: {post_args}")
     if HALF_PRECISION:
-      post_args += ["-Xcompiler", "/D HALF_PRECISION"]
-  else:
-    post_args += ['-c', '--compiler-options', "'-fPIC'",
-                  "--compiler-options", "'-std=c++14'"]
-    if HALF_PRECISION:
-      post_args += ["--compiler-options", "'-D HALF_PRECISION'"]
-  for k, val in cudaconfig.items():
-    if not os.path.exists(val):
-      logging.warning('The CUDA %s path could not be located in %s', k, val)
-      return None
+        post_args = [flag for flag in post_args if "52" not in flag]
 
-  cudaconfig['post_args'] = post_args
-  return cudaconfig
+    # Append additional compiler options for non-Windows platforms
+    if sys.platform != "win32":
+        post_args += ['-c', '--compiler-options', "'-fPIC'",
+                      "--compiler-options", "'-std=c++14'"]
+        if HALF_PRECISION:
+            post_args += ["--compiler-options", "'-D HALF_PRECISION'"]
+
+    # Check that all CUDA directories exist
+    for k, val in cudaconfig.items():
+        if not os.path.exists(val):
+            logging.warning('The CUDA %s path could not be located in %s', k, val)
+            return None
+
+    cudaconfig['post_args'] = post_args
+    return cudaconfig
 
 
 # This code to build .cu extensions with nvcc is taken from cupy:
