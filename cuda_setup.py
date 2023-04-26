@@ -4,8 +4,7 @@
 # This source code is licensed under the Apache 2.0 license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Adapted from https://github.com/rmcgibbo/npcuda-example and
-# https://github.com/cupy/cupy/blob/master/cupy_setup_build.py
+# Adapted from https://gist.github.com/f0k/63a664160d016a491b2cbea15913d549
 # pylint: disable=fixme,access-member-before-definition
 # pylint: disable=attribute-defined-outside-init,arguments-differ
 import logging
