@@ -1,0 +1,6 @@
+__pycache__/*
+.idea/*
+/3rd/*
+/build/*
+*egg
+*egg*
